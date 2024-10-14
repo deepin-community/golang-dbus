@@ -3,52 +3,88 @@ package dbus
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"sync"
 	"testing"
 	"time"
 )
 
 func TestSessionBus(t *testing.T) {
-	_, err := SessionBus()
+	oldConn, err := SessionBus()
 	if err != nil {
 		t.Error(err)
+	}
+	if err = oldConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if oldConn.Connected() {
+		t.Fatal("Should be closed")
+	}
+	newConn, err := SessionBus()
+	if err != nil {
+		t.Error(err)
+	}
+	if newConn == oldConn {
+		t.Fatal("Should get a new connection")
 	}
 }
 
 func TestSystemBus(t *testing.T) {
-	_, err := SystemBus()
+	oldConn, err := SystemBus()
 	if err != nil {
 		t.Error(err)
 	}
-}
-
-func ExampleSystemBusPrivate() {
-	setupPrivateSystemBus := func() (conn *Conn, err error) {
-		conn, err = SystemBusPrivate()
-		if err != nil {
-			return nil, err
-		}
-		if err = conn.Auth(nil); err != nil {
-			conn.Close()
-			conn = nil
-			return
-		}
-		if err = conn.Hello(); err != nil {
-			conn.Close()
-			conn = nil
-		}
-		return conn, nil // success
+	if err = oldConn.Close(); err != nil {
+		t.Fatal(err)
 	}
-	_, _ = setupPrivateSystemBus()
+	if oldConn.Connected() {
+		t.Fatal("Should be closed")
+	}
+	newConn, err := SystemBus()
+	if err != nil {
+		t.Error(err)
+	}
+	if newConn == oldConn {
+		t.Fatal("Should get a new connection")
+	}
 }
 
-func TestSend(t *testing.T) {
-	bus, err := SessionBus()
+func TestConnectSessionBus(t *testing.T) {
+	conn, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.Connected() {
+		t.Fatal("Should be closed")
+	}
+}
+
+func TestConnectSystemBus(t *testing.T) {
+	conn, err := ConnectSystemBus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.Connected() {
+		t.Fatal("Should be closed")
+	}
+}
+
+func TestSend(t *testing.T) {
+	bus, err := ConnectSessionBus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bus.Close()
+
 	ch := make(chan *Call, 1)
 	msg := &Message{
 		Type:  TypeMethodCall,
@@ -68,10 +104,12 @@ func TestSend(t *testing.T) {
 }
 
 func TestFlagNoReplyExpectedSend(t *testing.T) {
-	bus, err := SessionBus()
+	bus, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer bus.Close()
+
 	done := make(chan struct{})
 	go func() {
 		bus.BusObject().Call("org.freedesktop.DBus.ListNames", FlagNoReplyExpected)
@@ -193,26 +231,82 @@ func TestCloseChannelAfterRemoveSignal(t *testing.T) {
 			FieldPath:      MakeVariant(ObjectPath("/baz")),
 		},
 	}
-	bus.handleSignal(msg)
+	bus.handleSignal(Sequence(1), msg)
 
 	// Remove and close the signal channel
 	bus.RemoveSignal(ch)
 	close(ch)
 }
 
-func TestAddAndRemoveMatchSignal(t *testing.T) {
-	conn, err := SessionBusPrivate()
+func TestAddAndRemoveMatchSignalContext(t *testing.T) {
+	conn, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
 
-	if err = conn.Auth(nil); err != nil {
+	sigc := make(chan *Signal, 1)
+	conn.Signal(sigc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// try to subscribe to a made up signal with an already canceled context
+	if err = conn.AddMatchSignalContext(
+		ctx,
+		WithMatchInterface("org.test"),
+		WithMatchMember("CtxTest"),
+	); err == nil {
+		t.Fatal("call on canceled context did not fail")
+	}
+
+	// subscribe to the signal with background context
+	if err = conn.AddMatchSignalContext(
+		context.Background(),
+		WithMatchInterface("org.test"),
+		WithMatchMember("CtxTest"),
+	); err != nil {
 		t.Fatal(err)
 	}
-	if err = conn.Hello(); err != nil {
+
+	// try to unsubscribe with an already canceled context
+	if err = conn.RemoveMatchSignalContext(
+		ctx,
+		WithMatchInterface("org.test"),
+		WithMatchMember("CtxTest"),
+	); err == nil {
+		t.Fatal("call on canceled context did not fail")
+	}
+
+	// check that signal is still delivered
+	if err = conn.Emit("/", "org.test.CtxTest"); err != nil {
 		t.Fatal(err)
 	}
+	if sig := waitSignal(sigc, "org.test.CtxTest", time.Second); sig == nil {
+		t.Fatal("signal receive timed out")
+	}
+
+	// unsubscribe from the signal
+	if err = conn.RemoveMatchSignalContext(
+		context.Background(),
+		WithMatchInterface("org.test"),
+		WithMatchMember("CtxTest"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.Emit("/", "org.test.CtxTest"); err != nil {
+		t.Fatal(err)
+	}
+	if sig := waitSignal(sigc, "org.test.CtxTest", time.Second); sig != nil {
+		t.Fatalf("unsubscribed from %q signal, but received %#v", "org.test.CtxTest", sig)
+	}
+}
+
+func TestAddAndRemoveMatchSignal(t *testing.T) {
+	conn, err := ConnectSessionBus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
 
 	sigc := make(chan *Signal, 1)
 	conn.Signal(sigc)
@@ -259,6 +353,167 @@ func waitSignal(sigc <-chan *Signal, name string, timeout time.Duration) *Signal
 	}
 }
 
+const (
+	SCPPInterface         = "org.godbus.DBus.StatefulTest"
+	SCPPPath              = "/org/godbus/DBus/StatefulTest"
+	SCPPChangedSignalName = "Changed"
+	SCPPStateMethodName   = "State"
+)
+
+func TestStateCachingProxyPattern(t *testing.T) {
+	srv, err := ConnectSessionBus()
+	defer srv.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := ConnectSessionBus(WithSignalHandler(NewSequentialSignalHandler()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	serviceName := srv.Names()[0]
+	// message channel should have at least some buffering, to make sure Eavesdrop does not
+	// drop the message if nobody is currently trying to read from the channel.
+	messages := make(chan *Message, 1)
+	srv.Eavesdrop(messages)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := serverProcess(ctx, srv, messages, t); err != nil {
+			t.Errorf("error in server process: %v", err)
+			cancel()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := clientProcess(ctx, conn, serviceName, t); err != nil {
+			t.Errorf("error in client process: %v", err)
+		}
+		// Cancel the server process.
+		cancel()
+	}()
+	wg.Wait()
+}
+
+func clientProcess(ctx context.Context, conn *Conn, serviceName string, t *testing.T) error {
+	// Subscribe to state changes on the remote object
+	if err := conn.AddMatchSignal(
+		WithMatchInterface(SCPPInterface),
+		WithMatchMember(SCPPChangedSignalName),
+	); err != nil {
+		return err
+	}
+	channel := make(chan *Signal)
+	conn.Signal(channel)
+	t.Log("Subscribed to signals")
+
+	// Simulate unfavourable OS scheduling leading to a delay between subscription
+	// and querying for the current state.
+	time.Sleep(30 * time.Millisecond)
+
+	// Call .State() on the remote object to get its current state and store in observedStates[0].
+	obj := conn.Object(serviceName, SCPPPath)
+	observedStates := make([]uint64, 1)
+	call := obj.CallWithContext(ctx, SCPPInterface+"."+SCPPStateMethodName, 0)
+	if err := call.Store(&observedStates[0]); err != nil {
+		return err
+	}
+	t.Logf("Queried current state, got %v", observedStates[0])
+
+	// Populate observedStates[1...49] based on the state change signals,
+	// ignoring signals with a sequence number less than call.ResponseSequence so that we ignore past signals.
+	signalsProcessed := 0
+readSignals:
+	for {
+		select {
+		case signal := <-channel:
+			signalsProcessed++
+			if signal.Name == SCPPInterface+"."+SCPPChangedSignalName && signal.Sequence > call.ResponseSequence {
+				observedState := signal.Body[0].(uint64)
+				observedStates = append(observedStates, observedState)
+				// Observing at least 50 states gives us low probability that we received a contiguous subsequence of states 'by accident'
+				if len(observedStates) >= 50 {
+					break readSignals
+				}
+			}
+		case <-ctx.Done():
+			t.Logf("Context cancelled, client processed %v signals", signalsProcessed)
+			return ctx.Err()
+		}
+	}
+	t.Logf("client processed %v signals", signalsProcessed)
+
+	// Expect that we begun observing at least a few states in. This ensures the server was already emitting signals
+	// and makes it likely we simulated our race condition.
+	if observedStates[0] < 10 {
+		return fmt.Errorf("expected first state to be at least 10, got %v", observedStates[0])
+	}
+
+	t.Logf("Observed states: %v", observedStates)
+
+	// The observable states of the remote object were [1 ... (infinity)] during this test.
+	// This loop is intended to assert that our observed states are a contiguous subgrange [n ... n+49] for some n, i.e.
+	// that we received a contiguous subsequence of the states of the remote object. For each run of the test, n
+	// may be slightly different due to scheduling effects.
+	for i := 0; i < len(observedStates); i++ {
+		expectedState := observedStates[0] + uint64(i)
+		if observedStates[i] != expectedState {
+			return fmt.Errorf("expected observed state %v to be %v, got %v", i, expectedState, observedStates[i])
+		}
+	}
+	return nil
+}
+
+func serverProcess(ctx context.Context, srv *Conn, messages <-chan *Message, t *testing.T) error {
+	state := uint64(0)
+
+process:
+	for {
+		select {
+		case msg, ok := <-messages:
+			if !ok {
+				t.Log("Message channel closed")
+				// Message channel closed.
+				break process
+			}
+			if msg.IsValid() != nil {
+				t.Log("Got invalid message, discarding")
+				continue process
+			}
+			name := msg.Headers[FieldMember].value.(string)
+			ifname := msg.Headers[FieldInterface].value.(string)
+			if ifname == SCPPInterface && name == SCPPStateMethodName {
+				t.Logf("Processing reply to .State(), returning state = %v", state)
+				reply := new(Message)
+				reply.Type = TypeMethodReply
+				reply.Headers = make(map[HeaderField]Variant)
+				reply.Headers[FieldDestination] = msg.Headers[FieldSender]
+				reply.Headers[FieldReplySerial] = MakeVariant(msg.serial)
+				reply.Body = make([]interface{}, 1)
+				reply.Body[0] = state
+				reply.Headers[FieldSignature] = MakeVariant(SignatureOf(reply.Body...))
+				srv.sendMessageAndIfClosed(reply, nil)
+			}
+		case <-ctx.Done():
+			t.Logf("Context cancelled, server emitted %v signals", state)
+			return nil
+		default:
+			state++
+			if err := srv.Emit(SCPPPath, SCPPInterface+"."+SCPPChangedSignalName, state); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 type server struct{}
 
 func (server) Double(i int64) (int64, *Error) {
@@ -269,10 +524,12 @@ func BenchmarkCall(b *testing.B) {
 	b.StopTimer()
 	b.ReportAllocs()
 	var s string
-	bus, err := SessionBus()
+	bus, err := ConnectSessionBus()
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer bus.Close()
+
 	name := bus.Names()[0]
 	obj := bus.BusObject()
 	b.StartTimer()
@@ -290,10 +547,12 @@ func BenchmarkCall(b *testing.B) {
 func BenchmarkCallAsync(b *testing.B) {
 	b.StopTimer()
 	b.ReportAllocs()
-	bus, err := SessionBus()
+	bus, err := ConnectSessionBus()
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer bus.Close()
+
 	name := bus.Names()[0]
 	obj := bus.BusObject()
 	c := make(chan *Call, 50)
@@ -320,58 +579,56 @@ func BenchmarkCallAsync(b *testing.B) {
 
 func BenchmarkServe(b *testing.B) {
 	b.StopTimer()
-	srv, err := SessionBus()
+	srv, err := ConnectSessionBus()
 	if err != nil {
 		b.Fatal(err)
 	}
-	cli, err := SessionBusPrivate()
+	defer srv.Close()
+
+	cli, err := ConnectSessionBus()
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err = cli.Auth(nil); err != nil {
-		b.Fatal(err)
-	}
-	if err = cli.Hello(); err != nil {
-		b.Fatal(err)
-	}
+	defer cli.Close()
+
 	benchmarkServe(b, srv, cli)
 }
 
 func BenchmarkServeAsync(b *testing.B) {
 	b.StopTimer()
-	srv, err := SessionBus()
+	srv, err := ConnectSessionBus()
 	if err != nil {
 		b.Fatal(err)
 	}
-	cli, err := SessionBusPrivate()
+	defer srv.Close()
+
+	cli, err := ConnectSessionBus()
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err = cli.Auth(nil); err != nil {
-		b.Fatal(err)
-	}
-	if err = cli.Hello(); err != nil {
-		b.Fatal(err)
-	}
+	defer cli.Close()
+
 	benchmarkServeAsync(b, srv, cli)
 }
 
 func BenchmarkServeSameConn(b *testing.B) {
 	b.StopTimer()
-	bus, err := SessionBus()
+	bus, err := ConnectSessionBus()
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer bus.Close()
 
 	benchmarkServe(b, bus, bus)
 }
 
 func BenchmarkServeSameConnAsync(b *testing.B) {
 	b.StopTimer()
-	bus, err := SessionBus()
+	bus, err := ConnectSessionBus()
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer bus.Close()
 
 	benchmarkServeAsync(b, bus, bus)
 }
@@ -434,7 +691,7 @@ func TestGetKey(t *testing.T) {
 }
 
 func TestInterceptors(t *testing.T) {
-	conn, err := SessionBusPrivate(
+	conn, err := ConnectSessionBus(
 		WithIncomingInterceptor(func(msg *Message) {
 			log.Println("<", msg)
 		}),
@@ -446,31 +703,14 @@ func TestInterceptors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-
-	if err = conn.Auth(nil); err != nil {
-		t.Fatal(err)
-	}
-	if err = conn.Hello(); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestCloseCancelsConnectionContext(t *testing.T) {
-	bus, err := SessionBusPrivate()
+	bus, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer bus.Close()
-
-	if err = bus.Auth(nil); err != nil {
-		t.Fatal(err)
-	}
-	if err = bus.Hello(); err != nil {
-		t.Fatal(err)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	// The context is not done at this point
 	ctx := bus.Context()
@@ -551,6 +791,28 @@ func TestCancellingContextClosesConnection(t *testing.T) {
 	// Cancel the connection's parent context and give time for
 	// other goroutines to schedule.
 	cancel()
+	time.Sleep(50 * time.Millisecond)
+
+	err = bus.BusObject().Call("org.freedesktop.DBus.Peer.Ping", 0).Store()
+	if err != ErrClosed {
+		t.Errorf("expected connection to be closed, but got: %v", err)
+	}
+}
+
+// TestTimeoutContextClosesConnection checks that a Conn instance is closed after
+// the passed context's deadline is missed.
+// The test also checks that there's no data race between Conn creation and its
+// automatic closing.
+func TestTimeoutContextClosesConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+
+	bus, err := NewConn(rwc{}, WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// wait until the connection is actually closed
 	time.Sleep(50 * time.Millisecond)
 
 	err = bus.BusObject().Call("org.freedesktop.DBus.Peer.Ping", 0).Store()

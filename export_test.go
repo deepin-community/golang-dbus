@@ -34,12 +34,31 @@ func (export badExport) Foo(param string) string {
 	return "bar"
 }
 
+type errorExport struct {
+	message Message
+}
+
+func (export *errorExport) Run(message Message, param string) (string, error) {
+	export.message = message
+	return "pass", nil
+}
+
+type noErrorExport struct {
+	message Message
+}
+
+func (export *noErrorExport) Run(message Message, param string) (string) {
+	export.message = message
+	return "cool"
+}
+
 // Test typical Export usage.
 func TestExport(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -72,12 +91,71 @@ func TestExport(t *testing.T) {
 	}
 }
 
-// Test that Exported handlers can obtain raw message.
-func TestExport_message(t *testing.T) {
-	connection, err := SessionBus()
+// Test that Exported handlers can use a go error type.
+func TestExport_goerror(t *testing.T) {
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
+
+	name := connection.Names()[0]
+
+	export := &errorExport{}
+	connection.ExportAll(export, "/org/guelfey/DBus/Test", "org.guelfey.DBus.Test")
+	object := connection.Object(name, "/org/guelfey/DBus/Test")
+
+	var response string
+	err = object.Call("org.guelfey.DBus.Test.Run", 0, "qux").Store(&response)
+	if err != nil {
+		t.Errorf("Unexpected error calling Foo: %s", err)
+	}
+
+	if response != "pass" {
+		t.Errorf(`Response was %s, expected "foo"`, response)
+	}
+
+	if export.message.serial == 0 {
+		t.Error("Expected a valid message to be given to handler")
+	}
+}
+
+// Test that Exported handlers can have no error.
+func TestExport_noerror(t *testing.T) {
+	connection, err := ConnectSessionBus()
+	if err != nil {
+		t.Fatalf("Unexpected error connecting to session bus: %s", err)
+	}
+	defer connection.Close()
+
+	name := connection.Names()[0]
+
+	export := &noErrorExport{}
+	connection.ExportAll(export, "/org/guelfey/DBus/Test", "org.guelfey.DBus.Test")
+	object := connection.Object(name, "/org/guelfey/DBus/Test")
+
+	var response string
+	err = object.Call("org.guelfey.DBus.Test.Run", 0, "qux").Store(&response)
+	if err != nil {
+		t.Errorf("Unexpected error calling Foo: %s", err)
+	}
+
+	if response != "cool" {
+		t.Errorf(`Response was %s, expected "foo"`, response)
+	}
+
+	if export.message.serial == 0 {
+		t.Error("Expected a valid message to be given to handler")
+	}
+}
+
+// Test that Exported handlers can obtain raw message.
+func TestExport_message(t *testing.T) {
+	connection, err := ConnectSessionBus()
+	if err != nil {
+		t.Fatalf("Unexpected error connecting to session bus: %s", err)
+	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -102,10 +180,11 @@ func TestExport_message(t *testing.T) {
 
 // Test Export with an invalid path.
 func TestExport_invalidPath(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	err = connection.Export(nil, "foo", "bar")
 	if err == nil {
@@ -116,10 +195,11 @@ func TestExport_invalidPath(t *testing.T) {
 // Test Export with an un-exported method. This should not panic, but rather
 // result in an invalid method call.
 func TestExport_unexportedMethod(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -137,10 +217,11 @@ func TestExport_unexportedMethod(t *testing.T) {
 // Test Export with a method lacking the correct return signature. This should
 // result in an invalid method call.
 func TestExport_badSignature(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -157,10 +238,11 @@ func TestExport_badSignature(t *testing.T) {
 
 // Test typical ExportWithMap usage.
 func TestExportWithMap(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -183,10 +265,11 @@ func TestExportWithMap(t *testing.T) {
 
 // Test that ExportWithMap does not export both method alias and method.
 func TestExportWithMap_bypassAlias(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -206,10 +289,11 @@ func TestExportWithMap_bypassAlias(t *testing.T) {
 
 // Test typical ExportSubtree usage.
 func TestExportSubtree(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -244,10 +328,11 @@ func TestExportSubtree(t *testing.T) {
 // Test that using ExportSubtree with exported methods that don't contain a
 // Message still work, they just don't get the message.
 func TestExportSubtree_noMessage(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -276,10 +361,11 @@ func TestExportSubtree_noMessage(t *testing.T) {
 
 // Test that a regular Export takes precedence over ExportSubtree.
 func TestExportSubtree_exportPrecedence(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -321,10 +407,11 @@ func TestExportSubtree_exportPrecedence(t *testing.T) {
 
 // Test typical ExportSubtreeWithMap usage.
 func TestExportSubtreeWithMap(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -357,10 +444,11 @@ func TestExportSubtreeWithMap(t *testing.T) {
 
 // Test that ExportSubtreeWithMap does not export both method alias and method.
 func TestExportSubtreeWithMap_bypassAlias(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -379,10 +467,11 @@ func TestExportSubtreeWithMap_bypassAlias(t *testing.T) {
 }
 
 func TestExportMethodTable(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 	export := &fooExport{}
@@ -431,10 +520,11 @@ func TestExportMethodTable(t *testing.T) {
 }
 
 func TestExportSubtreeMethodTable(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
@@ -485,10 +575,11 @@ func TestExportSubtreeMethodTable(t *testing.T) {
 }
 
 func TestExportMethodTable_NotFunc(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 	export := &fooExport{}
@@ -522,10 +613,11 @@ func TestExportMethodTable_NotFunc(t *testing.T) {
 }
 
 func TestExportMethodTable_ReturnNotError(t *testing.T) {
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 	export := &fooExport{}
@@ -577,10 +669,11 @@ func TestExportSubPathIntrospection(t *testing.T) {
 			</interface>
 			</node>`
 	)
-	connection, err := SessionBus()
+	connection, err := ConnectSessionBus()
 	if err != nil {
 		t.Fatalf("Unexpected error connecting to session bus: %s", err)
 	}
+	defer connection.Close()
 
 	name := connection.Names()[0]
 
